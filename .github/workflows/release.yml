@@ -53,14 +53,29 @@ jobs:
           asset_path: ./resources/lib/ecb_cli.exe
           asset_name: ecb_cli.exe
           asset_content_type: application/vnd.microsoft.portable-executable
+      - name: Resolve Windows installer asset
+        shell: pwsh
+        run: |
+          $asset = Get-ChildItem -Path ./dist -File -Filter "EcuBus-Pro *.exe" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (-not $asset) {
+            Write-Error "No installer executable found under ./dist"
+            Get-ChildItem -Path ./dist -Recurse
+            exit 1
+          }
+
+          echo "WINDOWS_ASSET_PATH=./dist/$($asset.Name)" >> $env:GITHUB_ENV
+          echo "WINDOWS_ASSET_NAME=$($asset.Name)" >> $env:GITHUB_ENV
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps
-          asset_path: ./dist/EcuBus-Pro ${{ env.VERSION }}.exe
-          asset_name: EcuBus-Pro ${{ env.VERSION }}.exe
+          asset_path: ${{ env.WINDOWS_ASSET_PATH }}
+          asset_name: ${{ env.WINDOWS_ASSET_NAME }}
           asset_content_type: application/vnd.microsoft.portable-executable
       - name: Archive Release
         uses: thedoctor0/zip-release@0.7.5
