@@ -170,8 +170,11 @@ export class SLCAN_CAN extends CanBase {
             let supportsCanFd = false
 
             if (
-              parseInt(port.vendorId ?? '0', 16) === 0xad50 &&
-              parseInt(port.productId ?? '0', 16) === 0x60c4
+              (parseInt(port.vendorId ?? '0', 16) === 0xad50 &&
+              parseInt(port.productId ?? '0', 16) === 0x60c4) || (
+                parseInt(port.vendorId ?? '0', 16) === 0x0403 &&
+                parseInt(port.productId ?? '0', 16) === 0x6015
+              )
             ) {
               // CANable 1.0 or similar ST USB CDC device
               isCanable = true
