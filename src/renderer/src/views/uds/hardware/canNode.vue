@@ -476,7 +476,8 @@ const configInfo: Record<CanVendor, any> = {
         { clock: '30', name: '30' },
         { clock: '40', name: '40' },
         { clock: '60', name: '60' },
-        { clock: '80', name: '80' }
+        { clock: '80', name: '80' },
+        { clock: '160', name: '160' }
       ],
       preScaler: {
         min: 1,
@@ -506,7 +507,8 @@ const configInfo: Record<CanVendor, any> = {
         { clock: '30', name: '30' },
         { clock: '40', name: '40' },
         { clock: '60', name: '60' },
-        { clock: '80', name: '80' }
+        { clock: '80', name: '80' },
+        { clock: '160', name: '160' }
       ],
       preScaler: {
         min: 1,
