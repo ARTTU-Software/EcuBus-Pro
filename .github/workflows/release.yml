@@ -8,12 +8,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Build job
   build-windows:
     runs-on: windows-latest
     permissions: write-all
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
     env:
       ALIYUN_ACCESS_KEY_ID: ${{ secrets.ALIYUN_ACCESS_KEY_ID }}
       ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}
@@ -37,70 +34,30 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           main_vite_client_id: ${{ secrets.CLIENT_ID }}
           main_vite_client_secret: ${{ secrets.CLIENT_SECRET }}
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # This token is provided by Actions, you do not need to create your own token
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          draft: false
-          prerelease: false
-      - name: Upload CLI
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./resources/lib/ecb_cli.exe
-          asset_name: ecb_cli.exe
-          asset_content_type: application/vnd.microsoft.portable-executable
-      - name: Resolve Windows installer asset
-        shell: pwsh
-        run: |
-          $asset = Get-ChildItem -Path ./dist -File -Filter "EcuBus-Pro *.exe" |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-
-          if (-not $asset) {
-            Write-Error "No installer executable found under ./dist"
-            Get-ChildItem -Path ./dist -Recurse
-            exit 1
-          }
-
-          echo "WINDOWS_ASSET_PATH=./dist/$($asset.Name)" >> $env:GITHUB_ENV
-          echo "WINDOWS_ASSET_NAME=$($asset.Name)" >> $env:GITHUB_ENV
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps
-          asset_path: ${{ env.WINDOWS_ASSET_PATH }}
-          asset_name: ${{ env.WINDOWS_ASSET_NAME }}
-          asset_content_type: application/vnd.microsoft.portable-executable
       - name: Archive Release
         uses: thedoctor0/zip-release@0.7.5
         with:
           type: zip
           directory: ./dist/win-unpacked
           filename: Portable EcuBus-Pro ${{ env.VERSION }}.zip
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stage Windows assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ./dist/release-stage
+          Copy-Item -Path "./dist/win-unpacked/Portable EcuBus-Pro *.zip" -Destination ./dist/release-stage/
+          Copy-Item -Path ./resources/lib/ecb_cli.exe -Destination ./dist/release-stage/
+          $exe = Get-ChildItem -Path ./dist -File -Filter "EcuBus-Pro *.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          Copy-Item -Path $exe.FullName -Destination ./dist/release-stage/
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./dist/win-unpacked/Portable EcuBus-Pro ${{ env.VERSION }}.zip
-          asset_name: Portable EcuBus-Pro ${{ env.VERSION }}.zip
-          asset_content_type: application/zip
+          name: windows-artifacts
+          path: ./dist/release-stage/*
       - name: Upload to aliyun
         if: ${{ env.ALIYUN_ACCESS_KEY_ID != '' && env.ALIYUN_ACCESS_KEY_SECRET != '' }}
         run: node tools/upload.js --note --app
 
   build-linux:
-    needs: build-windows
     runs-on: ubuntu-latest
     permissions: write-all
     steps:
@@ -123,36 +80,20 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           main_vite_client_id: ${{ secrets.CLIENT_ID }}
           main_vite_client_secret: ${{ secrets.CLIENT_SECRET }}
-      - name: Upload CLI
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stage Linux assets
+        shell: bash
+        run: |
+          mkdir -p ./dist/release-stage
+          cp ./resources/lib/ecb_cli ./dist/release-stage/
+          cp $(find ./dist -maxdepth 1 -name "*.deb" | head -n 1) ./dist/release-stage/
+          cp $(find ./dist -maxdepth 1 -name "*.rpm" | head -n 1) ./dist/release-stage/
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ needs.build-windows.outputs.upload_url }}
-          asset_path: ./resources/lib/ecb_cli
-          asset_name: ecb_cli
-          asset_content_type: application/octet-stream
-      - name: Upload DEB
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.build-windows.outputs.upload_url }}
-          asset_path: ./dist/ecubuspro_${{ env.VERSION }}_amd64.deb
-          asset_name: EcuBus-Pro_${{ env.VERSION }}_amd64.deb
-          asset_content_type: application/vnd.debian.binary-package
-      - name: Upload RPM
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.build-windows.outputs.upload_url }}
-          asset_path: ./dist/ecubuspro-${{ env.VERSION }}.x86_64.rpm
-          asset_name: EcuBus-Pro_${{ env.VERSION }}_x86_64.rpm
-          asset_content_type: application/x-rpm
+          name: linux-artifacts
+          path: ./dist/release-stage/*
 
   build-mac:
-    needs: build-windows
     runs-on: macos-13
     permissions: write-all
     steps:
@@ -175,31 +116,151 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           main_vite_client_id: ${{ secrets.CLIENT_ID }}
           main_vite_client_secret: ${{ secrets.CLIENT_SECRET }}
-      - name: Upload CLI
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.build-windows.outputs.upload_url }}
-          asset_path: ./resources/lib/ecb_cli
-          asset_name: ecb_cli_mac
-          asset_content_type: application/octet-stream
-      - name: Resolve macOS DMG asset
+      - name: Stage macOS assets
         shell: bash
         run: |
-          asset=$(find ./dist -maxdepth 1 -name "EcuBus-Pro *.dmg" | head -n 1)
-          if [ -z "$asset" ]; then
-            echo "No dmg found"
-            exit 1
-          fi
-          echo "MAC_ASSET_PATH=$asset" >> $GITHUB_ENV
-          echo "MAC_ASSET_NAME=$(basename "$asset")" >> $GITHUB_ENV
-      - name: Upload DMG
+          mkdir -p ./dist/release-stage
+          cp ./resources/lib/ecb_cli ./dist/release-stage/
+          cp $(find ./dist -maxdepth 1 -name "EcuBus-Pro *.dmg" | head -n 1) ./dist/release-stage/
+      - name: Upload macOS Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-artifacts
+          path: ./dist/release-stage/*
+
+  publish-release:
+    needs: [build-windows, build-linux, build-mac]
+    runs-on: ubuntu-latest
+    permissions: write-all
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set Version
+        id: version
+        shell: bash
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          echo "VERSION=$version" >> $GITHUB_ENV
+      - name: Download Windows Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-artifacts
+          path: dist/win
+      - name: Download Linux Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-artifacts
+          path: dist/linux
+      - name: Download Mac Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-artifacts
+          path: dist/mac
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+      - name: Resolve Windows assets
+        shell: bash
+        run: |
+          exe_path=$(find dist/win -maxdepth 1 -name "*.exe" ! -name "ecb_cli.exe" | head -n 1)
+          zip_path=$(find dist/win -maxdepth 1 -name "*.zip" | head -n 1)
+          echo "WIN_EXE_PATH=$exe_path" >> $GITHUB_ENV
+          echo "WIN_EXE_NAME=$(basename "$exe_path")" >> $GITHUB_ENV
+          echo "WIN_ZIP_PATH=$zip_path" >> $GITHUB_ENV
+          echo "WIN_ZIP_NAME=$(basename "$zip_path")" >> $GITHUB_ENV
+      - name: Upload Windows EXE
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ needs.build-windows.outputs.upload_url }}
-          asset_path: ${{ env.MAC_ASSET_PATH }}
-          asset_name: ${{ env.MAC_ASSET_NAME }}
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ env.WIN_EXE_PATH }}
+          asset_name: ${{ env.WIN_EXE_NAME }}
+          asset_content_type: application/vnd.microsoft.portable-executable
+      - name: Upload Windows ZIP
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ env.WIN_ZIP_PATH }}
+          asset_name: ${{ env.WIN_ZIP_NAME }}
+          asset_content_type: application/zip
+      - name: Upload Windows CLI
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: dist/win/ecb_cli.exe
+          asset_name: ecb_cli.exe
+          asset_content_type: application/vnd.microsoft.portable-executable
+      - name: Resolve Linux assets
+        shell: bash
+        run: |
+          deb_path=$(find dist/linux -maxdepth 1 -name "*.deb" | head -n 1)
+          rpm_path=$(find dist/linux -maxdepth 1 -name "*.rpm" | head -n 1)
+          echo "LINUX_DEB_PATH=$deb_path" >> $GITHUB_ENV
+          echo "LINUX_DEB_NAME=$(basename "$deb_path")" >> $GITHUB_ENV
+          echo "LINUX_RPM_PATH=$rpm_path" >> $GITHUB_ENV
+          echo "LINUX_RPM_NAME=$(basename "$rpm_path")" >> $GITHUB_ENV
+      - name: Upload Linux DEB
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ env.LINUX_DEB_PATH }}
+          asset_name: ${{ env.LINUX_DEB_NAME }}
+          asset_content_type: application/vnd.debian.binary-package
+      - name: Upload Linux RPM
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ env.LINUX_RPM_PATH }}
+          asset_name: ${{ env.LINUX_RPM_NAME }}
+          asset_content_type: application/x-rpm
+      - name: Upload Linux CLI
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: dist/linux/ecb_cli
+          asset_name: ecb_cli
+          asset_content_type: application/octet-stream
+      - name: Resolve Mac assets
+        shell: bash
+        run: |
+          dmg_path=$(find dist/mac -maxdepth 1 -name "*.dmg" | head -n 1)
+          echo "MAC_DMG_PATH=$dmg_path" >> $GITHUB_ENV
+          echo "MAC_DMG_NAME=$(basename "$dmg_path")" >> $GITHUB_ENV
+      - name: Upload Mac DMG
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ env.MAC_DMG_PATH }}
+          asset_name: ${{ env.MAC_DMG_NAME }}
+          asset_content_type: application/octet-stream
+      - name: Upload Mac CLI
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: dist/mac/ecb_cli
+          asset_name: ecb_cli_mac
           asset_content_type: application/octet-stream
