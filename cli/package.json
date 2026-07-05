@@ -12,6 +12,6 @@
   "scripts": {
     "linux": "npx webpack && pkg . -t node20-linux",
     "win": "npx webpack && pkg . -t node20-win",
-    "mac": "npx webpack && pkg . -t node20-macos"
+    "mac": "npx webpack && pkg . -t node20-macos-x64"
   }
 }

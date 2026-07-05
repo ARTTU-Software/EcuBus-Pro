@@ -85,8 +85,8 @@ jobs:
         run: |
           mkdir -p ./dist/release-stage
           cp ./resources/lib/ecb_cli ./dist/release-stage/
-          cp $(find ./dist -maxdepth 1 -name "*.deb" | head -n 1) ./dist/release-stage/
-          cp $(find ./dist -maxdepth 1 -name "*.rpm" | head -n 1) ./dist/release-stage/
+          cp "$(find ./dist -maxdepth 1 -name "*.deb" | head -n 1)" ./dist/release-stage/
+          cp "$(find ./dist -maxdepth 1 -name "*.rpm" | head -n 1)" ./dist/release-stage/
       - name: Upload Linux Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -94,7 +94,7 @@ jobs:
           path: ./dist/release-stage/*
 
   build-mac:
-    runs-on: macos-13
+    runs-on: macos-latest
     permissions: write-all
     steps:
       - name: Checkout
@@ -121,7 +121,7 @@ jobs:
         run: |
           mkdir -p ./dist/release-stage
           cp ./resources/lib/ecb_cli ./dist/release-stage/
-          cp $(find ./dist -maxdepth 1 -name "EcuBus-Pro *.dmg" | head -n 1) ./dist/release-stage/
+          cp "$(find ./dist -maxdepth 1 -name "*.dmg" | head -n 1)" ./dist/release-stage/
       - name: Upload macOS Artifacts
         uses: actions/upload-artifact@v4
         with:

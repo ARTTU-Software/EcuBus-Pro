@@ -24,10 +24,13 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Remove local .npmrc for CI
+      shell: bash
+      run: rm -f .npmrc
     - name: Setup Node
       uses: actions/setup-node@v4
       with:
-        node-version: 24
+        node-version: 22
         cache: npm
     - name: Install dependencies
       shell: bash
@@ -54,8 +57,9 @@ runs:
       run: npm run build:sdk
     - name: Build APP
       shell: bash
-      run: npm run build:${{ inputs.platform }}
+      run: npm run build:${{ inputs.platform }} -- --publish never
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
         MAIN_VITE_CLIENT_ID: ${{ inputs.main_vite_client_id }}
         MAIN_VITE_CLIENT_SECRET: ${{ inputs.main_vite_client_secret }}
+        NODE_OPTIONS: --max-old-space-size=4096
