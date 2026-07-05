@@ -54,7 +54,7 @@ runs:
       run: npm run build:sdk
     - name: Build APP
       shell: bash
-      run: npm run build:${{ inputs.platform }}
+      run: npm run build:${{ inputs.platform }} -- --publish never
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
         MAIN_VITE_CLIENT_ID: ${{ inputs.main_vite_client_id }}

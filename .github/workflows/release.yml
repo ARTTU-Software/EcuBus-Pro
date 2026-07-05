@@ -94,7 +94,7 @@ jobs:
           path: ./dist/release-stage/*
 
   build-mac:
-    runs-on: macos-13
+    runs-on: macos-latest
     permissions: write-all
     steps:
       - name: Checkout
