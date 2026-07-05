@@ -93,6 +93,7 @@ jobs:
           asset_name: Portable EcuBus-Pro ${{ env.VERSION }}.zip
           asset_content_type: application/zip
       - name: Upload to aliyun
+        if: ${{ secrets.ALIYUN_ACCESS_KEY_ID != '' && secrets.ALIYUN_ACCESS_KEY_SECRET != '' }}
         env:
           ALIYUN_ACCESS_KEY_ID: ${{ secrets.ALIYUN_ACCESS_KEY_ID }}
           ALIYUN_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_ACCESS_KEY_SECRET }}
@@ -149,3 +150,56 @@ jobs:
           asset_path: ./dist/ecubuspro-${{ env.VERSION }}.x86_64.rpm
           asset_name: EcuBus-Pro_${{ env.VERSION }}_x86_64.rpm
           asset_content_type: application/x-rpm
+
+  build-mac:
+    needs: build-windows
+    runs-on: macos-13
+    permissions: write-all
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set Version
+        id: version
+        shell: bash
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          echo "VERSION=$version" >> $GITHUB_ENV
+      - name: Setup Embedding Python
+        uses: ./.github/actions/setup-python-build
+      - name: Build App
+        uses: ./.github/actions/build-app
+        with:
+          platform: mac
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          main_vite_client_id: ${{ secrets.CLIENT_ID }}
+          main_vite_client_secret: ${{ secrets.CLIENT_SECRET }}
+      - name: Upload CLI
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.build-windows.outputs.upload_url }}
+          asset_path: ./resources/lib/ecb_cli
+          asset_name: ecb_cli_mac
+          asset_content_type: application/octet-stream
+      - name: Resolve macOS DMG asset
+        shell: bash
+        run: |
+          asset=$(find ./dist -maxdepth 1 -name "EcuBus-Pro *.dmg" | head -n 1)
+          if [ -z "$asset" ]; then
+            echo "No dmg found"
+            exit 1
+          fi
+          echo "MAC_ASSET_PATH=$asset" >> $GITHUB_ENV
+          echo "MAC_ASSET_NAME=$(basename "$asset")" >> $GITHUB_ENV
+      - name: Upload DMG
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.build-windows.outputs.upload_url }}
+          asset_path: ${{ env.MAC_ASSET_PATH }}
+          asset_name: ${{ env.MAC_ASSET_NAME }}
+          asset_content_type: application/octet-stream
