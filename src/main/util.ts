@@ -117,17 +117,34 @@ export function getJsPath(tsPath: string, projectPath: string) {
   return jsPath
 }
 
-export function setSignal(data: { signal: string; value: number | number[] | string }) {
+type CanSignalChanged = (messageId: number) => void
+let canSignalChanged: CanSignalChanged | undefined
+
+/**
+ * Main process hook. CAN `setSignal` calls this with the message id after the
+ * signal value is stored, so interaction period rows can refresh `ia.data`
+ * even when the measurement-start signal Proxy is not installed.
+ */
+export function onCanSignalChanged(handler?: CanSignalChanged) {
+  canSignalChanged = handler
+}
+
+export function setSignal(data: {
+  signal: string
+  value: number | number[] | string
+}): number | undefined {
   const s = data.signal.split('.')
   // 验证数据库是否存在
   const db = Object.values(global.dataSet.database.can).find((db) => db.name == s[0])
   if (db) {
     const signalName = s[1]
     let ss: CanSignal | undefined
+    let messageId: number | undefined
     for (const msg of db.messages) {
       for (const signal of msg.signals) {
         if (signal.name == signalName) {
           ss = signal
+          messageId = msg.id
           break
         }
       }
@@ -149,6 +166,8 @@ export function setSignal(data: { signal: string; value: number | number[] | str
       ss.value = data.value.toString()
       updateSignalRaw(ss)
     }
+    if (messageId != undefined) canSignalChanged?.(messageId)
+    return messageId
   } else {
     const linDb = Object.values(global.dataSet.database.lin).find((db) => db.name == s[0])
     if (linDb) {
@@ -162,4 +181,5 @@ export function setSignal(data: { signal: string; value: number | number[] | str
       updateLinSignalVal(linDb, signalName, data.value)
     }
   }
+  return undefined
 }

@@ -1,6 +1,7 @@
 import path from 'path'
 import fs from 'fs'
 import { CanAddr, CanMessage, formatError, getTsUs, swapAddr } from './share/can'
+import { shouldDeliverCanFrameToNode } from './share/canScriptNotify'
 import { TesterInfo } from './share/tester'
 import UdsTester, {
   linApiBaudRateCtrl,
@@ -15,6 +16,7 @@ import { CAN_TP, CAN_TP_SOCKET, TpError as CanTpError } from './docan/cantp'
 import { UdsLOG, VarLOG } from './log'
 import { applyBuffer, getRxPdu, getTxPdu, PwmBaseInfo, ServiceItem, UdsDevice } from './share/uds'
 import { findService, UDSTesterMain } from './docan/uds'
+import { forwardUdsSeqProgress } from './share/udsSeqProgress'
 import { cloneDeep } from 'lodash'
 
 import { NodeItem } from 'src/preload/data'
@@ -33,6 +35,7 @@ import { PwmBase } from './pwm'
 import { SerialBase } from './serial'
 import { SerialMessage } from './share/serial'
 import { setSignal } from './util'
+import { injectSimulateControllerError } from '../cli/rpc/lifecycle'
 import { VSomeIP_Client } from './vsomeip'
 import { SomeipMessage, SomeipMessageType, VsomeipAvailabilityInfo } from './share/someip'
 type TestTree = {
@@ -88,6 +91,7 @@ export class NodeClass {
   private pwmBaseId: string[] = []
   private serialBaseId: string[] = []
   private someipBaseId: string[] = []
+  private someipCbs: Map<string, (msg: SomeipMessage) => void> = new Map()
   private startTs = 0
   private boundCb: (frame: CanMessage | LinMsg | SomeipMessage | SerialMessage) => void
   private boundSomeipServiceValidCb: (info: VsomeipAvailabilityInfo) => void
@@ -166,11 +170,7 @@ export class NodeClass {
         this.testOptions
       )
       if (this.testOptions) {
-        this.log?.systemMsg(
-          `----- Test Config ${this.nodeItem.name} starting -----`,
-          getTsUs(),
-          'info'
-        )
+        this.log?.systemMsg(`START  Test Config ${this.nodeItem.name} starting`, getTsUs(), 'info')
       }
     }
   }
@@ -229,7 +229,12 @@ export class NodeClass {
       const someipBaseItem = this.someipMap.get(c)
       if (someipBaseItem) {
         this.someipBaseId.push(c)
-        someipBaseItem.attachSomeipMessage(this.boundCb)
+        const wrappedSomeipCb = (msg: SomeipMessage) => {
+          msg.device = someipBaseItem.info.name
+          this.boundCb(msg)
+        }
+        this.someipCbs.set(c, wrappedSomeipCb)
+        someipBaseItem.attachSomeipMessage(wrappedSomeipCb)
         someipBaseItem.attachSomeipServiceValid(this.boundSomeipServiceValidCb)
       }
     }
@@ -822,7 +827,7 @@ export class NodeClass {
     const info = await this.pool?.getTestInfo()
     if (this.testOptions) {
       this.log?.systemMsg(
-        `----- Test Config ${this.nodeItem.name} finished, total time: ${((getTsUs() - this.startTs) / 1000).toFixed(2)}ms -----`,
+        `DONE   Test Config ${this.nodeItem.name} finished, total time: ${((getTsUs() - this.startTs) / 1000).toFixed(2)}ms`,
         getTsUs(),
         'info'
       )
@@ -1019,6 +1024,20 @@ export class NodeClass {
       if (!entry) throw new Error(`CAN-TP handle '${data.handle}' not found`)
       const result = await entry.socket.read(data.timeout ?? 5000)
       return { data: Array.from(result.data), ts: result.ts }
+    }
+
+    if (op === 'injectError') {
+      const base = findCanBase(data.device)
+      if (base.info.vendor !== 'simulate') {
+        throw new Error(
+          `CAN error injection only supports simulate devices, got ${base.info.vendor}`
+        )
+      }
+      return injectSimulateControllerError({
+        errorState: String(data.errorState ?? ''),
+        txErrorCounter: data.txErrorCounter,
+        rxErrorCounter: data.rxErrorCounter
+      })
     }
 
     throw new Error(`unknown canApi op: ${op}`)
@@ -1400,7 +1419,8 @@ export class NodeClass {
     }
     return 0
   }
-  async runUdsSeq(data: { name: string; device?: string }) {
+  async runUdsSeq(data: { name: string; device?: string; progressId?: number }) {
+    const onProgress = forwardUdsSeqProgress(this.pool, data.progressId)
     let targetDevice: UdsDevice | undefined
     if (this.nodeItem.channel.length > 0) {
       for (const id of this.nodeItem.channel) {
@@ -1453,7 +1473,7 @@ export class NodeClass {
           if (canBase) {
             uds.setCanBase(this.canBaseMap.get(targetDevice.canDevice.id))
             this.udsTesterMap.set(data.name, uds)
-            await uds.runSequence(seqIndex, cycle)
+            await uds.runSequence(seqIndex, cycle, onProgress)
           } else {
             throw new Error(
               `can device ${targetDevice.canDevice.vendor}-${targetDevice.canDevice.handle} not found`
@@ -1465,7 +1485,7 @@ export class NodeClass {
           if (ethBase) {
             uds.setDoip(ethBase)
             this.udsTesterMap.set(data.name, uds)
-            await uds.runSequence(seqIndex, cycle)
+            await uds.runSequence(seqIndex, cycle, onProgress)
           } else {
             throw new Error(
               `eth device ${targetDevice.ethDevice.vendor}-${targetDevice.ethDevice.device.handle} not found`
@@ -1477,7 +1497,7 @@ export class NodeClass {
           if (linBase) {
             uds.setLinBase(linBase)
             this.udsTesterMap.set(data.name, uds)
-            await uds.runSequence(seqIndex, cycle)
+            await uds.runSequence(seqIndex, cycle, onProgress)
           } else {
             throw new Error(
               `lin device ${targetDevice.linDevice.vendor}-${targetDevice.linDevice.device.handle} not found`
@@ -1514,7 +1534,10 @@ export class NodeClass {
       }
       const someipBaseItem = this.someipMap.get(c)
       if (someipBaseItem) {
-        someipBaseItem.detachSomeipMessage(this.boundCb)
+        const wrappedSomeipCb = this.someipCbs.get(c)
+        if (wrappedSomeipCb) {
+          someipBaseItem.detachSomeipMessage(wrappedSomeipCb)
+        }
         someipBaseItem.detachSomeipServiceValid(this.boundSomeipServiceValidCb)
       }
       const serialBaseItem = this.serialBaseMap.get(c)
@@ -1561,10 +1584,11 @@ export class NodeClass {
     this.canBaseId.length = 0
     this.ethBaseId.length = 0
   }
-  async start(testControl?: Record<number, boolean>) {
+  async start(testControl?: Record<number, boolean>, signal?: AbortSignal) {
     this.pool?.updateTs(0)
     if (this.pool) {
-      await this.pool.start(this.projectPath, this.nodeItem.name, testControl)
+      await this.pool.start(this.projectPath, this.nodeItem.name, testControl, signal)
+      signal?.throwIfAborted()
       if (this.pool.methods.includes('__setTxPending')) {
         //can
         this.canBaseMap.forEach((base) => {
@@ -1587,7 +1611,9 @@ export class NodeClass {
       this.log?.scriptMsg(e.toString(), getTsUs(), 'error')
     }
     if ('msgType' in frame) {
-      if (frame.msgType.uuid != this.nodeItem.id) {
+      // IA TX is logged as can-frame with no node uuid, so OnSignal sees it like an RX frame.
+      // A script's own output() is stamped with this node id and is not echoed back.
+      if (shouldDeliverCanFrameToNode(frame, this.nodeItem.id)) {
         void this.pool?.triggerCanFrame(frame).catch(reportAsyncError)
       }
     } else if ('dir' in frame) {

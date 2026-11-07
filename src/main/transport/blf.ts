@@ -1,9 +1,9 @@
 import fs from 'fs'
-import path from 'path'
 import zlib from 'zlib'
-import dayjs from 'dayjs'
 import Transport from 'winston-transport'
-import { CanMessage } from '../share/can'
+import { CAN_ID_TYPE, CanMessage } from '../share/can'
+import { canDlc2Len, canLen2Dlc } from '../share/asc'
+import { getMeasurementStartMs } from './asc'
 
 // ---- BLF constants ----
 const FILE_HEADER_SIZE = 144
@@ -13,11 +13,9 @@ const LOG_CONTAINER_HEADER_SIZE = 16
 const MAX_CONTAINER_SIZE_DEFAULT = 128 * 1024
 const APPLICATION_ID = 5
 
-const CAN_MESSAGE = 1
 const LOG_CONTAINER = 10
 const CAN_ERROR_EXT = 73
 const CAN_MESSAGE2 = 86
-const GLOBAL_MARKER = 96
 const CAN_FD_MESSAGE = 100
 
 const NO_COMPRESSION = 0
@@ -31,18 +29,6 @@ const BRS = 0x2
 const ESI = 0x4
 const TIME_ONE_NANS = 0x00000002
 
-// DLC helpers
-function len2dlc(len: number): number {
-  if (len <= 8) return len
-  if (len <= 12) return 9
-  if (len <= 16) return 10
-  if (len <= 20) return 11
-  if (len <= 24) return 12
-  if (len <= 32) return 13
-  if (len <= 48) return 14
-  return 15
-}
-
 type SystemTimeParts = [number, number, number, number, number, number, number, number]
 const EMPTY_SYSTEM_TIME: SystemTimeParts = [0, 0, 0, 0, 0, 0, 0, 0]
 
@@ -53,14 +39,14 @@ function toSystemTimeParts(tsNs?: bigint): SystemTimeParts {
   const ms = Number(tsNs / 1_000_000n)
   const dt = new Date(ms)
   return [
-    dt.getUTCFullYear(),
-    dt.getUTCMonth() + 1,
-    dt.getUTCDay(),
-    dt.getUTCDate(),
-    dt.getUTCHours(),
-    dt.getUTCMinutes(),
-    dt.getUTCSeconds(),
-    dt.getUTCMilliseconds()
+    dt.getFullYear(),
+    dt.getMonth() + 1,
+    dt.getDay(),
+    dt.getDate(),
+    dt.getHours(),
+    dt.getMinutes(),
+    dt.getSeconds(),
+    dt.getMilliseconds()
   ]
 }
 
@@ -72,12 +58,43 @@ function writeSystemTime(buf: Buffer, offset: number, tsNs?: bigint) {
 }
 
 function padData(len: number): number {
+  // BLF stores padding bytes equal to the remainder, not the amount needed to align to 4.
   const mod = len % 4
   return mod === 0 ? 0 : mod
 }
 
 function clampLen(len: number, max: number): number {
   return Math.max(0, Math.min(len, max))
+}
+
+export type BlfCanFrameInput = {
+  id: number
+  data: Buffer
+  channel: number
+  tsUs?: number
+  extended?: boolean
+}
+
+/** Write a small uncompressed BLF of classic CAN frames. Used by replay tests. */
+export function writeBlfCanFrames(filePath: string, frames: BlfCanFrameInput[]): Promise<void> {
+  const writer = new BlfWriter(filePath, { compressionLevel: 0 })
+  for (const frame of frames) {
+    const msg: CanMessage = {
+      id: frame.id,
+      dir: 'OUT',
+      data: frame.data,
+      msgType: {
+        idType: frame.extended ? CAN_ID_TYPE.EXTENDED : CAN_ID_TYPE.STANDARD,
+        brs: false,
+        canfd: false,
+        remote: false
+      }
+    }
+    writer.writeCanMessage(msg, frame.channel, frame.tsUs ?? 0)
+  }
+  return new Promise((resolve) => {
+    writer.stop(() => resolve())
+  })
 }
 
 class BlfWriter {
@@ -93,6 +110,7 @@ class BlfWriter {
   private maxContainerSize: number
   private compressionLevel: number
   private _pendingFlush = 0
+  private compressionQueue: Promise<void> = Promise.resolve()
 
   constructor(filePath: string, opts?: { compressionLevel?: number; maxContainerSize?: number }) {
     this.filePath = filePath
@@ -151,7 +169,7 @@ class BlfWriter {
 
   private ensureStartTimes() {
     if (!this.startTimeNs) {
-      this.startTimeNs = BigInt(Date.now()) * 1_000_000n
+      this.startTimeNs = BigInt(Math.round(getMeasurementStartMs())) * 1_000_000n
       this.stopTimeNs = this.startTimeNs
     }
   }
@@ -185,12 +203,17 @@ class BlfWriter {
     objHeader.writeBigUInt64LE(timestampNs >= 0n ? timestampNs : 0n, 8)
 
     const paddingSize = padData(data.length)
+    const bufferedObjectSize = objSize + paddingSize
+
+    if (this.bufferSize > 0 && this.bufferSize + bufferedObjectSize > this.maxContainerSize) {
+      this.flush()
+    }
 
     this.bufferParts.push(baseHeader, objHeader, data)
     if (paddingSize) {
       this.bufferParts.push(Buffer.alloc(paddingSize))
     }
-    this.bufferSize += objSize + paddingSize
+    this.bufferSize += bufferedObjectSize
     this.objectCount += 1
 
     if (this.bufferSize >= this.maxContainerSize) {
@@ -200,20 +223,24 @@ class BlfWriter {
 
   writeCanMessage(msg: CanMessage, channel: number, tsUs?: number) {
     const arbId = msg.msgType.idType === 'EXTENDED' ? msg.id | CAN_MSG_EXT : msg.id
-    const flags = (msg.msgType.remote ? REMOTE_FLAG : 0) | (msg.dir === 'OUT' ? DIR : 0)
+    const remote = msg.msgType.remote
+    const flags = (remote ? REMOTE_FLAG : 0) | (msg.dir === 'OUT' ? DIR : 0)
     const timestampNs = this.computeTimestampNs(tsUs)
     const dataBuf = Buffer.from(msg.data)
 
     if (msg.msgType.canfd) {
-      const fdFlags = EDL | (msg.msgType.brs ? BRS : 0) // ESI flag default 0
+      const fdFlags = EDL | (msg.msgType.brs ? BRS : 0) | (msg.msgType.esi ? ESI : 0)
+      const dlc = msg.dlc ?? canLen2Dlc(msg.data.length)
+      const validBytes = remote ? 0 : canDlc2Len(dlc, true)
 
+      // VBLCANFDMessage
       const data = Buffer.alloc(2 + 1 + 1 + 4 + 4 + 1 + 1 + 1 + 5 + 64)
       let offset = 0
       data.writeUInt16LE(channel, offset)
       offset += 2
       data.writeUInt8(flags, offset)
       offset += 1
-      data.writeUInt8(len2dlc(msg.data.length), offset)
+      data.writeUInt8(dlc, offset)
       offset += 1
       data.writeUInt32LE(arbId >>> 0, offset)
       offset += 4
@@ -223,57 +250,43 @@ class BlfWriter {
       offset += 1
       data.writeUInt8(fdFlags, offset)
       offset += 1
-      data.writeUInt8(clampLen(msg.data.length, 64), offset)
+      data.writeUInt8(validBytes, offset)
       offset += 1
       offset += 5 // padding
 
-      const copyLen = clampLen(dataBuf.length, 64)
-      dataBuf.copy(data, offset, 0, copyLen)
+      dataBuf.copy(data, offset, 0, validBytes)
 
       this.addObject(CAN_FD_MESSAGE, data, timestampNs)
     } else {
-      const data = Buffer.alloc(2 + 1 + 1 + 4 + 8)
+      const dlc = msg.dlc ?? clampLen(msg.data.length, 8)
+
+      // VBLCANMessage2
+      const data = Buffer.alloc(2 + 1 + 1 + 4 + 8 + 4 + 1 + 1 + 2)
       let offset = 0
       data.writeUInt16LE(channel, offset)
       offset += 2
       data.writeUInt8(flags, offset)
       offset += 1
-      data.writeUInt8(clampLen(msg.data.length, 8), offset)
+      data.writeUInt8(dlc, offset)
       offset += 1
       data.writeUInt32LE(arbId >>> 0, offset)
       offset += 4
 
-      const copyLen = clampLen(dataBuf.length, 8)
-      dataBuf.copy(data, offset, 0, copyLen)
+      if (!remote) {
+        dataBuf.copy(data, offset, 0, clampLen(dataBuf.length, 8))
+      }
+      // frame length, bit count and reserved fields stay zero
 
-      this.addObject(CAN_MESSAGE, data, timestampNs)
+      this.addObject(CAN_MESSAGE2, data, timestampNs)
     }
   }
 
   writeError(channel: number, tsUs?: number) {
     const timestampNs = this.computeTimestampNs(tsUs)
-    const data = Buffer.alloc(2 + 2 + 4 + 1 + 1 + 1 + 1 + 4 + 2 + 2 + 8)
-    let offset = 0
-    data.writeUInt16LE(channel, offset) // channel
-    offset += 2
-    data.writeUInt16LE(0, offset) // length
-    offset += 2
-    data.writeUInt32LE(0, offset) // flags
-    offset += 4
-    data.writeUInt8(0, offset) // ecc
-    offset += 1
-    data.writeUInt8(0, offset) // position
-    offset += 1
-    data.writeUInt8(0, offset) // dlc
-    offset += 1
-    data.writeUInt8(0, offset) // frame length
-    offset += 1
-    data.writeUInt32LE(0, offset) // arbitration id
-    offset += 4
-    data.writeUInt16LE(0, offset) // ext flags
-    offset += 2
-    offset += 2 // padding
-    // data field (8 bytes) left zeroed
+    // VBLCANErrorFrameExt: channel, length, flags, ECC, position, DLC, reserved1,
+    // frame length in ns, ID, flagsExt, reserved2, data[8]
+    const data = Buffer.alloc(2 + 2 + 4 + 1 + 1 + 1 + 1 + 4 + 4 + 2 + 2 + 8)
+    data.writeUInt16LE(channel, 0)
 
     this.addObject(CAN_ERROR_EXT, data, timestampNs)
   }
@@ -285,10 +298,9 @@ class BlfWriter {
       return
     }
 
-    const uncompressed = buffer.subarray(0, this.maxContainerSize)
-    const tail = buffer.subarray(this.maxContainerSize)
-    this.bufferParts = tail.length ? [tail] : []
-    this.bufferSize = tail.length
+    const uncompressed = buffer
+    this.bufferParts = []
+    this.bufferSize = 0
 
     if (this.compressionLevel === 0) {
       this._writeContainer(uncompressed, uncompressed, NO_COMPRESSION)
@@ -303,23 +315,27 @@ class BlfWriter {
    */
   private _compressAndWrite(uncompressed: Buffer) {
     this._pendingFlush++
-    const chunks: Buffer[] = []
-    const deflate = zlib.createDeflate({ level: this.compressionLevel })
+    this.compressionQueue = this.compressionQueue.then(
+      () =>
+        new Promise<void>((resolve) => {
+          const chunks: Buffer[] = []
+          const deflate = zlib.createDeflate({ level: this.compressionLevel })
 
-    // Collect compressed chunks directly
-    deflate.on('data', (chunk: Buffer) => chunks.push(chunk))
-    deflate.on('end', () => {
-      const payload = Buffer.concat(chunks)
-      this._writeContainer(uncompressed, payload, ZLIB_DEFLATE)
-      this._pendingFlush--
-    })
-    deflate.on('error', (err) => {
-      console.error('BLF compression error:', err)
-      this._pendingFlush--
-    })
-
-    // Write directly to deflate stream (no intermediate PassThrough)
-    deflate.end(uncompressed)
+          deflate.on('data', (chunk: Buffer) => chunks.push(chunk))
+          deflate.on('end', () => {
+            const payload = Buffer.concat(chunks)
+            this._writeContainer(uncompressed, payload, ZLIB_DEFLATE)
+            this._pendingFlush--
+            resolve()
+          })
+          deflate.on('error', (err) => {
+            console.error('BLF compression error:', err)
+            this._pendingFlush--
+            resolve()
+          })
+          deflate.end(uncompressed)
+        })
+    )
   }
 
   /**
@@ -501,14 +517,6 @@ export default (
   method: string[],
   compressionLevel?: number
 ) => {
-  const timestamp = dayjs().format('YYYYMMDDHHmmss')
-  const parsedPath = path.parse(filePath)
-  const fileWithSuffix = path.format({
-    dir: parsedPath.dir,
-    name: `${parsedPath.name}_${timestamp}`,
-    ext: parsedPath.ext
-  })
-
   const channelOrder = Object.keys((global as any).dataSet?.devices || {})
-  return new BlfTransport(fileWithSuffix, devices, method, channelOrder, compressionLevel)
+  return new BlfTransport(filePath, devices, method, channelOrder, compressionLevel)
 }

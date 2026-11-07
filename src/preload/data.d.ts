@@ -167,6 +167,7 @@ export type PanelItem = {
   name: string
   rule: any[]
   options: Object
+  document?: import('./panel').PanelDocument
 }
 
 export type LogItem = {
@@ -223,6 +224,13 @@ export type ReplayChannelMap = {
   logChannel: number
   /** Device IDs to replay to (supports multiple targets) */
   deviceIds: string[]
+}
+
+/** Distinct log channels seen while sampling the start of a replay file. */
+export type ReplayLogChannelScan = {
+  channels: number[]
+  truncated: boolean
+  scanned: number
 }
 
 export type ReplayItem = {

@@ -1,5 +1,74 @@
 # EcuBus-Pro Release Notes
 
+## Unreleased
+
+## 0.8.68
+Changes since v0.8.67:
+
+* fix(can-ia): keep raw-data edits when sending database frames ([#484](https://github.com/ecubus/EcuBus-Pro/pull/484))
+* feat(replay): improve asc and blf logging ([#486](https://github.com/ecubus/EcuBus-Pro/pull/486))
+* docs(cdd): point vendored cddtools to its source commit ([#485](https://github.com/ecubus/EcuBus-Pro/pull/485))
+* fix(replay): warn when a log channel is missing from the channel map ([#483](https://github.com/ecubus/EcuBus-Pro/pull/483))
+* feat(cdd): add read-only fault code table and dtc selection for read dtc requests ([#482](https://github.com/ecubus/EcuBus-Pro/pull/482))
+* feat(worker): add an optional progress callback to runUdsSeq ([#478](https://github.com/ecubus/EcuBus-Pro/pull/478))
+* fix(test): show each case log without clearing the terminal ([#477](https://github.com/ecubus/EcuBus-Pro/pull/477))
+* refactor(panel): store panels in the project file and drop .ecpanel files ([#475](https://github.com/ecubus/EcuBus-Pro/pull/475))
+* fix(panel): open binding dialog in editor windows and fix README doc links ([#473](https://github.com/ecubus/EcuBus-Pro/pull/473))
+* fix(test): stream console output while a test is still running ([#472](https://github.com/ecubus/EcuBus-Pro/pull/472))
+* fix(can-ia): keep clipboard keys working while an interaction window is open ([#471](https://github.com/ecubus/EcuBus-Pro/pull/471))
+* fix(panel): keep slider, path and numeric drafts in sync with received values ([#470](https://github.com/ecubus/EcuBus-Pro/pull/470))
+* docs(panel): add panel examples to the PANEL catalog and refresh readme screenshots ([#467](https://github.com/ecubus/EcuBus-Pro/pull/467))
+* fix(panel): ignore variable writes until measurement has started ([#466](https://github.com/ecubus/EcuBus-Pro/pull/466))
+* Group each case in the Test log and highlight it from the tree ([#465](https://github.com/ecubus/EcuBus-Pro/pull/465))
+* fix(ipc): enhance error handling in build and global start processes
+* Update support.md ([#464](https://github.com/ecubus/EcuBus-Pro/pull/464))
+* fix(test): show status and duration for duplicate test names ([#463](https://github.com/ecubus/EcuBus-Pro/pull/463))
+* feat(panel): add free-layout panels and remember value option ([#450](https://github.com/ecubus/EcuBus-Pro/pull/450))
+* Serve PC MCAL JSON-RPC from Simulate CAN ([#459](https://github.com/ecubus/EcuBus-Pro/pull/459))
+* fix(can): pause tester present across physical and functional addresses ([#458](https://github.com/ecubus/EcuBus-Pro/pull/458))
+* fix(test): stop Node 24 from skipping every test in test_simple ([#457](https://github.com/ecubus/EcuBus-Pro/pull/457))
+* feat(slcan): support WeAct Studio USB2CANFD V2 firmware ([#456](https://github.com/ecubus/EcuBus-Pro/pull/456))
+* feat(doip): add optional OEM-specific routing activation field ([#453](https://github.com/ecubus/EcuBus-Pro/pull/453))
+* Update support.md
+
+## 0.8.67
+Changes since v0.8.66:
+
+* fix(logging): prevent dropped frames in multi-device logs by @crazy0104 in https://github.com/ecubus/EcuBus-Pro/pull/420
+* fix(cli): package vsomeip worker so SOME/IP tests can run headless by @muchbt in https://github.com/ecubus/EcuBus-Pro/pull/423
+* fix(logging): configure log destination and file names by @crazy0104 in https://github.com/ecubus/EcuBus-Pro/pull/421
+* Fix Peak ISO-TP instability during large UDS transfers (#425) by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/426
+* docs: add Cursor Cloud specific setup instructions to AGENTS.md by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/429
+* fix(logging): ASC 扩展帧 ID 补上末尾 x by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/430
+* Add Cloud Agent development environment config by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/431
+* feat(cli): JSON-RPC server for PC MCAL-CAN by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/424
+* fix(cdd): rebuild CDD import on cddtools, read field values correctly (#422) by @crazy0104 in https://github.com/ecubus/EcuBus-Pro/pull/434
+* fix(odx): accept byte fields written with a 0x prefix, and read comparams from the document (#422) by @crazy0104 in https://github.com/ecubus/EcuBus-Pro/pull/437
+* New Crowdin Translations by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/433
+* feat(ldf): sync node Protocol when General LIN Version changes by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/438
+* feat(lini): add select all / deselect all for schedule frame Active column by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/442
+* Upgrade Electron to 44 and use built-in window state persistence by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/443
+* feat(graph): overlay multiple variables on a single timeline by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/445
+* fix(worker): expose linStartScheduler in worker script bundle by @frankie-zeng in https://github.com/ecubus/EcuBus-Pro/pull/447
+
+## 0.8.66
+Changes since v0.8.65:
+
+ 
+* [feat]: add `ecb_cli rpc` JSON-RPC 2.0 server for PC MCAL-CAN (C) drivers
+* [feat]: GUI JSON-RPC gateway — external `Can.Write` is transmitted as Tx on live devices
+* [opt]:opt serial port in network
+* Fix device handling and CANLE frame definition consistency by @zhangjiance in https://github.com/ecubus/EcuBus-Pro/pull/383
+* Enhance raw data editor with auto-focus, tooltips, and context menu by @zhangjiance in https://github.com/ecubus/EcuBus-Pro/pull/386
+* fix(cdd): improve tester interface import by @EclipsedWing in https://github.com/ecubus/EcuBus-Pro/pull/387
+* Fix running selected test cases in test config by @EclipsedWing in https://github.com/ecubus/EcuBus-Pro/pull/391
+* feat(serial): add serial (UART) hardware device with script & trace integration. by @crazy0104 in https://github.com/ecubus/EcuBus-Pro/pull/399
+* Fix Vector LIN initialization failure by @EclipsedWing in https://github.com/ecubus/EcuBus-Pro/pull/401
+* Fix LDF parser optional channel name handling by @EclipsedWing in https://github.com/ecubus/EcuBus-Pro/pull/402
+* Fix Vector CAN/LIN channel filtering by bus type by @EclipsedWing in https://github.com/ecubus/EcuBus-Pro/pull/404
+---
+
+
 
 ## 0.8.65
 Changes since v0.8.64:

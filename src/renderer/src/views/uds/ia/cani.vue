@@ -1,5 +1,13 @@
 <template>
-  <div style="display: relative" @click="hideContextMenu" @contextmenu.prevent="onContextMenu">
+  <div
+    ref="rootEl"
+    class="ia-key-root"
+    tabindex="-1"
+    style="display: relative"
+    @mousedown="onIaPointerDown"
+    @click="hideContextMenu"
+    @contextmenu.prevent="onContextMenu"
+  >
     <VxeGrid
       ref="xGrid"
       v-bind="gridOptions"
@@ -434,6 +442,7 @@
             <CanISignal
               :message-id="formData.id"
               :database="formData.database"
+              :raw-data="formData.data"
               @change="handleDataChange"
             />
           </el-tab-pane>
@@ -497,6 +506,7 @@ import {
   CanMsgType,
   getDlcByLen
 } from 'nodeCan/can'
+import { interactionPayloadLength, rawHexIsPartial, rawPayloadIsBlank } from 'nodeCan/canIaData'
 import { VxeGridProps } from 'vxe-table'
 import { VxeGrid } from 'vxe-table'
 import { Icon } from '@iconify/vue'
@@ -516,16 +526,18 @@ import { ServiceItem, Sequence, getTxPduStr, getTxPdu } from 'nodeCan/uds'
 import { useDataStore } from '@r/stores/data'
 import { cloneDeep, isEqual } from 'lodash'
 import { onKeyStroke, onKeyUp } from '@vueuse/core'
+import { isEditableKeyEvent, shouldFocusIaRoot, shouldHandleIaShortcut } from './iaKeyGuard'
 import Signal from '../components/signal.vue'
 import databaseIcon from '@iconify/icons-material-symbols/database'
 import { GraphBindFrameValue, GraphNode } from 'src/preload/data'
 import { Message } from 'nodeCan/can'
-import { writeMessageData } from '@r/database/dbc/calc'
+import { ensureSignalDefaults, linkRawHexToSignals, messagePayloadHex } from '@r/database/dbc/calc'
 import { useGlobalStart, useRuntimeStore } from '@r/stores/runtime'
 import { v4 } from 'uuid'
 import i18next from 'i18next'
 
 const xGrid = ref()
+const rootEl = ref<HTMLElement | null>(null)
 const tooltipRowIndex = ref(-1)
 const tooltipTarget = ref<HTMLElement | null>(null)
 let tooltipTimer: ReturnType<typeof setTimeout> | null = null
@@ -775,56 +787,11 @@ watch(globalStart, (v) => {
     }
   }
 })
-function getLenByDlc(dlc: number, canFd: boolean) {
-  const map: Record<number, number> = {
-    0: 0,
-    1: 1,
-    2: 2,
-    3: 3,
-    4: 4,
-    5: 5,
-    6: 6,
-    7: 7,
-    8: 8,
-    9: 8,
-    10: 8,
-    11: 8,
-    12: 8,
-    13: 8,
-    14: 8,
-    15: 8
-  }
-  const mapFd: Record<number, number> = {
-    0: 0,
-    1: 1,
-    2: 2,
-    3: 3,
-    4: 4,
-    5: 5,
-    6: 6,
-    7: 7,
-    8: 8,
-    9: 12,
-    10: 16,
-    11: 20,
-    12: 24,
-    13: 32,
-    14: 48,
-    15: 64
-  }
-  if (canFd) {
-    return mapFd[dlc] || 0
-  } else {
-    return map[dlc] || 0
-  }
-}
 const dlcToLen = computed(() => {
   if (formData.value == undefined) {
     return 0
   }
-  const fd = formData.value.type.includes('fd')
-  const dlc = formData.value.dlc
-  return getLenByDlc(dlc, fd)
+  return interactionPayloadLength(formData.value.dlc, formData.value.type.includes('fd'))
 })
 function ceilClick(val: any) {
   popoverIndex.value = val.rowIndex
@@ -866,16 +833,7 @@ function idChange(v: string) {
   }
 }
 function dataChangeDone() {
-  if (formData.value && formData.value.database) {
-    const db = dataBase.database.can[formData.value.database]
-    if (db) {
-      const message = db.messages[parseInt(formData.value.id, 16)]
-      if (message) {
-        const data = Buffer.from(formData.value.data.map((v) => parseInt(v, 16)))
-        writeMessageData(message, data, db)
-      }
-    }
-  }
+  if (formData.value?.database) syncDatabaseFrame(formData.value, true)
 }
 const byteInputRefs = ref<any[]>([])
 function onByteFocus(event: FocusEvent) {
@@ -909,11 +867,10 @@ function dataChange(index: number, v: string) {
   }
 }
 function handleDataChange(data: Buffer) {
-  if (formData.value) {
-    for (let i = 0; i < data.length; i++) {
-      formData.value.data[i] = data[i].toString(16)
-    }
-  }
+  if (!formData.value) return
+  const len = interactionPayloadLength(formData.value.dlc, formData.value.type.includes('fd'))
+  const next = Array.from({ length: len }, (_, i) => (data[i] ?? 0).toString(16).padStart(2, '0'))
+  if (!isEqual(formData.value.data, next)) formData.value.data = next
 }
 
 function deleteFrame() {
@@ -966,6 +923,7 @@ function pasteFrame() {
     if (!Object.keys(devices.value).includes(frame.channel)) {
       frame.channel = channel
     }
+    if (frame.database) syncDatabaseFrame(frame, true)
     dataBase.ia[editIndex.value].action.push(frame)
   }
 }
@@ -996,8 +954,20 @@ function hideContextMenu() {
 
 const pressedKey = ref('')
 const animate = ref(false)
+const iaShortcutListener = { target: rootEl }
+
+function onIaPointerDown(event: MouseEvent) {
+  if (!shouldFocusIaRoot(event.target, rootEl.value)) return
+  rootEl.value?.focus({ preventScroll: true })
+}
+
+function iaDialogOpen() {
+  return editV.value || connectV.value || selectFrameVisible.value
+}
+
 onKeyStroke(true, (e) => {
-  // e.preventDefault()
+  // Bound send keys stay global while a run is active, but must not fire from a text field.
+  if (isEditableKeyEvent(e)) return
   if (globalStart.value) {
     const key = e.key
     pressedKey.value = key.toLocaleUpperCase()
@@ -1019,51 +989,68 @@ onKeyUp(true, () => {
   }, 200)
 })
 
-// Ctrl+C / Ctrl+V keyboard shortcuts for copy/paste frame
-onKeyStroke(['c', 'C'], (e) => {
-  if ((e.ctrlKey || e.metaKey) && !editV.value && !connectV.value && !selectFrameVisible.value) {
+// Ctrl+C / Ctrl+V copy or paste a frame only when this interaction table is focused.
+onKeyStroke(
+  ['c', 'C'],
+  (e) => {
+    if (!e.ctrlKey && !e.metaKey) return
+    if (iaDialogOpen() || !shouldHandleIaShortcut(e, rootEl.value)) return
     e.preventDefault()
     copyFrame()
-  }
-})
-onKeyStroke(['v', 'V'], (e) => {
-  if ((e.ctrlKey || e.metaKey) && !editV.value && !connectV.value && !selectFrameVisible.value) {
+  },
+  iaShortcutListener
+)
+onKeyStroke(
+  ['v', 'V'],
+  (e) => {
+    if (!e.ctrlKey && !e.metaKey) return
+    if (iaDialogOpen() || !shouldHandleIaShortcut(e, rootEl.value)) return
     e.preventDefault()
     pasteFrame()
-  }
-})
+  },
+  iaShortcutListener
+)
 
 // Arrow Up/Down: navigate between frame rows
-onKeyStroke('ArrowUp', (e) => {
-  if (!editV.value && !connectV.value && !selectFrameVisible.value) {
+onKeyStroke(
+  'ArrowUp',
+  (e) => {
+    if (iaDialogOpen() || !shouldHandleIaShortcut(e, rootEl.value)) return
     const actions = dataBase.ia[editIndex.value].action
     if (actions.length > 0 && popoverIndex.value > 0) {
       e.preventDefault()
       popoverIndex.value--
       xGrid.value?.setCurrentRow(actions[popoverIndex.value])
     }
-  }
-})
-onKeyStroke('ArrowDown', (e) => {
-  if (!editV.value && !connectV.value && !selectFrameVisible.value) {
+  },
+  iaShortcutListener
+)
+onKeyStroke(
+  'ArrowDown',
+  (e) => {
+    if (iaDialogOpen() || !shouldHandleIaShortcut(e, rootEl.value)) return
     const actions = dataBase.ia[editIndex.value].action
     if (actions.length > 0 && popoverIndex.value < actions.length - 1) {
       e.preventDefault()
       popoverIndex.value++
       xGrid.value?.setCurrentRow(actions[popoverIndex.value])
     }
-  }
-})
+  },
+  iaShortcutListener
+)
 
 // Delete key: delete selected frame
-onKeyStroke('Delete', (e) => {
-  if (!editV.value && !connectV.value && !selectFrameVisible.value) {
+onKeyStroke(
+  'Delete',
+  (e) => {
+    if (iaDialogOpen() || !shouldHandleIaShortcut(e, rootEl.value)) return
     if (popoverIndex.value >= 0 && !periodTimer.value[popoverIndex.value]) {
       e.preventDefault()
       deleteFrame()
     }
-  }
-})
+  },
+  iaShortcutListener
+)
 
 function sendFrame(index: number) {
   const frame = dataBase.ia[editIndex.value]?.action[index]
@@ -1138,20 +1125,90 @@ function openPr(index: number) {
   }
 }
 
+function signalsUnset(dbKey: string, id: number) {
+  const message = dataBase.database.can[dbKey]?.messages.find((msg) => msg.id === id)
+  if (!message) return false
+  return (message.signals || []).every(
+    (signal) => signal.value === undefined || signal.value === ''
+  )
+}
+
+function publishSignalsToMain(dbKey: string, id: number) {
+  if (!globalStart.value) return
+  const message = dataBase.database.can[dbKey]?.messages.find((msg) => msg.id === id)
+  if (!message) return
+  window.electron.ipcRenderer.send(
+    'ipc-sync-can-message-signals',
+    dbKey,
+    id,
+    cloneDeep(message.signals)
+  )
+}
+
+function mirrorCanonicalToRows(dbKey: string, id: number, editingUuid?: string) {
+  const message = dataBase.database.can[dbKey]?.messages.find((msg) => msg.id === id)
+  if (!message) return
+  for (const [iaId, inter] of Object.entries(dataBase.ia)) {
+    if (inter.type !== 'can') continue
+    inter.action.forEach((action, index) => {
+      if (action.database !== dbKey || parseInt(action.id, 16) !== id) return
+      if (editingUuid && action.uuid === editingUuid) return
+      const hex = messagePayloadHex(
+        message,
+        interactionPayloadLength(action.dlc, action.type.includes('fd'))
+      )
+      if (isEqual(action.data, hex)) return
+      action.data = hex
+      const periodKey = `${iaId}-${index}`
+      if (globalStart.value && runtime.canPeriods[periodKey]) {
+        window.electron.ipcRenderer.send('ipc-update-can-period', periodKey, cloneDeep(action))
+      }
+    })
+  }
+}
+
+/**
+ * Push ia.data into the live DBC message and, once every nibble is complete,
+ * store the signal encode back on the row so the two editors cannot drift.
+ * `forceCanonical` is the blur/paste commit: a half-typed nibble is normalized too.
+ * A still-zero row whose signals were never set is left alone so the signal pane
+ * can apply DBC initial values first.
+ */
+function syncDatabaseFrame(frame: CanInterAction, forceCanonical: boolean) {
+  if (!frame.database) return
+  const db = dataBase.database.can[frame.database]
+  if (!db) return
+  const id = parseInt(frame.id, 16)
+  if (!forceCanonical && rawPayloadIsBlank(frame.data) && signalsUnset(frame.database, id)) return
+  const canonical = linkRawHexToSignals(
+    db,
+    id,
+    frame.data,
+    interactionPayloadLength(frame.dlc, frame.type.includes('fd'))
+  )
+  if (!canonical) return
+  if ((forceCanonical || !rawHexIsPartial(frame.data)) && !isEqual(frame.data, canonical)) {
+    frame.data = canonical
+  }
+  publishSignalsToMain(frame.database, id)
+  mirrorCanonicalToRows(frame.database, id, frame.uuid)
+}
+
 watch(
   formData,
-  (v) => {
-    v = cloneDeep(v)
-    if (v && popoverIndex.value != -1) {
-      if (!isEqual(dataBase.ia[editIndex.value].action[popoverIndex.value], v)) {
-        Object.assign(dataBase.ia[editIndex.value].action[popoverIndex.value], v)
-        if (globalStart.value) {
-          window.electron.ipcRenderer.send(
-            'ipc-update-can-period',
-            `${editIndex.value}-${popoverIndex.value}`,
-            v
-          )
-        }
+  (frame) => {
+    if (!frame || popoverIndex.value == -1) return
+    if (frame.database) syncDatabaseFrame(frame, false)
+    const snapshot = cloneDeep(frame)
+    const stored = dataBase.ia[editIndex.value].action[popoverIndex.value]
+    if (stored && !isEqual(stored, snapshot)) {
+      Object.assign(stored, snapshot)
+      if (globalStart.value) {
+        window.electron.ipcRenderer.send(
+          'ipc-update-can-period',
+          `${editIndex.value}-${popoverIndex.value}`,
+          snapshot
+        )
       }
     }
   },
@@ -1182,19 +1239,29 @@ function handleFrameSelect(frame: GraphNode<GraphBindFrameValue>) {
         type = 'ecan'
       }
     }
-    // 创建新的 frame action
+    const dlc = getDlcByLen(frameInfo.length, frameInfo.is_fd)
+    const dbKey = frame.bindValue.dbKey
+    const dbMessage = dataBase.database.can[dbKey]?.messages.find((msg) => msg.id === frameInfo.id)
+    let data = new Array(interactionPayloadLength(dlc, type.includes('fd'))).fill('00')
+    if (dbMessage) {
+      ensureSignalDefaults(dbMessage)
+      data = messagePayloadHex(dbMessage, data.length)
+      publishSignalsToMain(dbKey, frameInfo.id)
+      mirrorCanonicalToRows(dbKey, frameInfo.id)
+    }
+    // 创建新的 frame action。原始字节与当前信号编码一致。
     dataBase.ia[editIndex.value].action.push({
       uuid: v4(),
       trigger: {
         type: 'manual'
       },
-      database: frame.bindValue.dbKey,
+      database: dbKey,
       name: frameInfo.name,
-      id: frameInfo.id.toString(16), // 转换为16进制字符串
+      id: frameInfo.id.toString(16),
       channel: channel,
       type: type,
-      dlc: getDlcByLen(frameInfo.length, frameInfo.is_fd),
-      data: new Array(frameInfo.length).fill('00') // 初始化数据为全0
+      dlc,
+      data
     })
   }
   selectFrameVisible.value = false
@@ -1297,6 +1364,10 @@ function openFrameSelect() {
 }
 </style>
 <style scoped>
+.ia-key-root:focus {
+  outline: none;
+}
+
 .key-box {
   position: absolute;
   bottom: 20px;

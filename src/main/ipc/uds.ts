@@ -1,8 +1,10 @@
+import { waitForStart } from '../startCancellation'
 import { BrowserWindow, ipcMain, shell } from 'electron'
 import scriptIndex from '../../../resources/docs/.gitkeep?asset&asarUnpack'
 import esbuild from '../../../resources/bin/esbuild.exe?asset&asarUnpack'
 import ascTransport from '../transport/asc'
 import blfTransport from '../transport/blf'
+import { resolveLogFilePath } from '../transport/filePath'
 let esbuild_executable = esbuild
 if (process.platform === 'darwin') {
   esbuild_executable = esbuild.replace('.exe', '_mac')
@@ -23,15 +25,15 @@ import {
 } from '../docan/uds'
 import {
   CAN_ID_TYPE,
-  CanDB,
   CanInterAction,
-  Message as CanDbMessage,
   Signal as CanSignal,
   formatError,
   getTsUs,
   swapAddr,
   CanMessage
 } from '../share/can'
+import { buildCanInterPayload, interactionPayloadLength } from '../share/canIaData'
+import { ASC_END, ASC_EOL, formatAscHeader, formatCanError, formatCanMessage } from '../share/asc'
 import { CAN_SOCKET, CanBase } from '../docan/base'
 import { CAN_TP, TpError } from '../docan/cantp'
 import { getParamBuffer, getTxPdu, UdsAddress, UdsDevice } from '../share/uds'
@@ -63,9 +65,9 @@ import { LinMode } from '../share/lin'
 import { LIN_TP } from '../dolin/lintp'
 import { TpError as LinTpError } from '../dolin/lintp'
 
-import { getMessageData } from 'src/renderer/src/database/dbc/calc'
+import { linkRawHexToSignals, writePeriodRowEncode } from 'src/renderer/src/database/dbc/calc'
 import { NodeClass } from '../nodeItem'
-import { getJsPath } from '../util'
+import { getJsPath, onCanSignalChanged } from '../util'
 import UdsTester from '../workerClient'
 import { serviceDetail } from '../uds/service'
 import { getAllSysVar } from '../share/sysVar'
@@ -83,6 +85,7 @@ import {
 
 import TraceItem from '../ostrace/item'
 import { startPlugins, stopPlugins } from './plugin'
+import { setProjectSimulateCount } from 'src/cli/rpc/lifecycle'
 import Replay, { ReplayReader } from '../replay'
 import { BlfReader } from '../replay/blfReader'
 import { AscReader } from '../replay/ascReader'
@@ -108,7 +111,12 @@ ipcMain.handle('ipc-get-build-status', async (event, ...arg) => {
   const projectPath = arg[0] as string
   const projectName = arg[1] as string
   const testerScript = arg[2] as string
-  return await getBuildStatus(projectPath, projectName, testerScript)
+  try {
+    return await getBuildStatus(projectPath, projectName, testerScript)
+  } catch (err: any) {
+    sysLog.error(err?.message || String(err))
+    throw err
+  }
 })
 
 ipcMain.handle('ipc-create-project', async (event, ...arg) => {
@@ -128,21 +136,26 @@ ipcMain.handle('ipc-build-project', async (event, ...arg) => {
   const entry = arg[3] as string
   const isTest = arg[4] || false
 
-  const result = await compileTsc(
-    projectPath,
-    projectName,
-    data,
-    entry,
-    esbuild_executable,
-    path.join(libPath, 'js'),
-    isTest
-  )
-  if (result.length > 0) {
-    for (const err of result) {
-      sysLog.error(`${err.file}:${err.line} build error: ${err.message}`)
+  try {
+    const result = await compileTsc(
+      projectPath,
+      projectName,
+      data,
+      entry,
+      esbuild_executable,
+      path.join(libPath, 'js'),
+      isTest
+    )
+    if (result.length > 0) {
+      for (const err of result) {
+        sysLog.error(`${err.file}:${err.line} build error: ${err.message}`)
+      }
     }
+    return result
+  } catch (err: any) {
+    sysLog.error(err?.message || String(err))
+    throw err
   }
-  return result
 })
 
 ipcMain.handle('ipc-get-test-info', async (event, ...arg) => {
@@ -339,7 +352,12 @@ function getDeviceSymbol(data: UdsDevice) {
   }
   return `${data.type}-${vendor || 'N/A'}`
 }
-async function globalStart(data: DataSet, projectInfo: { path: string; name: string }) {
+async function globalStart(
+  data: DataSet,
+  projectInfo: { path: string; name: string },
+  signal: AbortSignal
+) {
+  signal.throwIfAborted()
   const deviceSymboCnt: Record<string, number> = {}
   for (const key in data.devices) {
     const device = data.devices[key]
@@ -374,6 +392,7 @@ async function globalStart(data: DataSet, projectInfo: { path: string; name: str
   try {
     let cntIndex = 1
     for (const key in data.devices) {
+      signal.throwIfAborted()
       const device = data.devices[key]
       global.deviceIndexMap.set(key, cntIndex++)
       if (device.type == 'can' && device.canDevice) {
@@ -453,7 +472,18 @@ async function globalStart(data: DataSet, projectInfo: { path: string; name: str
         const serialDevice = device.serialDevice
         activeKey = serialDevice.name
         const serialBase = new SerialBase(serialDevice)
-        await serialBase.open()
+        try {
+          await waitForStart(
+            serialBase.open().then(async () => {
+              if (signal.aborted) await serialBase.close()
+            }),
+            signal
+          )
+          signal.throwIfAborted()
+        } catch (error) {
+          await serialBase.close()
+          throw error
+        }
         sysLog.info(
           `start serial device ${serialDevice.vendor}-${serialDevice.device.handle} success`
         )
@@ -468,9 +498,19 @@ async function globalStart(data: DataSet, projectInfo: { path: string; name: str
       } else if (device.type == 'someip' && device.someipDevice) {
         channleList.push(device.someipDevice.id)
         const val = device.someipDevice
-        const file = await generateConfigFile(val, projectInfo.path, data.devices)
+        const file = await waitForStart(
+          generateConfigFile(val, projectInfo.path, data.devices),
+          signal
+        )
+        signal.throwIfAborted()
         if (rounterInit == false) {
-          await startRouterCounter(file)
+          try {
+            await waitForStart(startRouterCounter(file), signal)
+            signal.throwIfAborted()
+          } catch (error) {
+            stopRouterCounter()
+            throw error
+          }
           rounterInit = true
         }
         const client = new VSomeIP_Client(val.name, file, val)
@@ -502,6 +542,7 @@ async function globalStart(data: DataSet, projectInfo: { path: string; name: str
     }
   } catch (err: any) {
     sysLog.error(`${activeKey} - ${err.toString()}`)
+    if (err && typeof err === 'object') err.sysLogged = true
     throw err
   }
 
@@ -651,6 +692,7 @@ async function globalStart(data: DataSet, projectInfo: { path: string; name: str
 
   //nodes
   for (const key in data.nodes) {
+    signal.throwIfAborted()
     const node = data.nodes[key]
     if (node.isTest) {
       continue
@@ -668,11 +710,13 @@ async function globalStart(data: DataSet, projectInfo: { path: string; name: str
       data.tester
     )
     try {
-      await nodeItem.start()
+      await waitForStart(nodeItem.start(undefined, signal), signal)
+      signal.throwIfAborted()
       nodeMap.set(key, nodeItem)
     } catch (err: any) {
-      nodeItem.log?.systemMsg(formatError(err), 0, 'error')
+      if (!signal.aborted) nodeItem.log?.systemMsg(formatError(err), 0, 'error')
       nodeItem.close()
+      signal.throwIfAborted()
     }
   }
 
@@ -693,8 +737,13 @@ async function globalStart(data: DataSet, projectInfo: { path: string; name: str
     pwmBaseMap,
     someipMap,
     serialBaseMap,
-    data.tester
+    data.tester,
+    signal
   )
+  signal.throwIfAborted()
+  const simulateCount = [...canBaseMap.values()].filter((b) => b.info.vendor === 'simulate').length
+  await setProjectSimulateCount(simulateCount)
+  signal.throwIfAborted()
   canBaseMap.forEach((base) => {
     base.resetStartTs?.()
   })
@@ -738,112 +787,116 @@ async function globalStart(data: DataSet, projectInfo: { path: string; name: str
 
 const exTransportList: string[] = []
 let isGlobalStarting = false
+let startController: AbortController | undefined
 ipcMain.handle('ipc-global-start', async (event, ...arg) => {
   if (isGlobalStarting) {
     return
   }
   isGlobalStarting = true
-  const projectInfo = arg[0] as {
-    path: string
-    name: string
-  }
-  const data = arg[1] as DataSet
+  const controller = new AbortController()
+  startController = controller
+  try {
+    const projectInfo = arg[0] as {
+      path: string
+      name: string
+    }
+    const data = arg[1] as DataSet
 
-  global.dataSet = data
-  for (const t of exTransportList) {
-    removeDeviceTransport(t)
-  }
-  exTransportList.splice(0, exTransportList.length)
+    logQ.signalSession = arg[2]
+    global.dataSet = data
+    for (const t of exTransportList) {
+      removeDeviceTransport(t)
+    }
+    exTransportList.splice(0, exTransportList.length)
 
-  //can signal as proxy
-  Object.values(global.dataSet.database.can).forEach((db) => {
-    Object.values(db.messages).forEach((msg) => {
-      const x = (target: any, prop: string, value: any) => {
-        const ret = Reflect.set(target, prop, value)
-        if (ret) {
-          for (const [index, d] of timerMap.entries()) {
-            if (parseInt(d.ia.id, 16) == msg.id) {
-              if (d.socket.changePeriodData) {
-                const data = send(index, false)
-                if (data && data.compare(d.data!) != 0) {
-                  d.socket.changePeriodData(d.taskId!, data)
-                  d.data = data
-                }
-              }
-            }
+    //can signal as proxy
+    Object.values(global.dataSet.database.can).forEach((db) => {
+      Object.values(db.messages).forEach((msg) => {
+        const x = (target: any, prop: string, value: any) => {
+          const ret = Reflect.set(target, prop, value)
+          if (ret) {
+            refreshCanPeriodData(msg.id)
           }
+          return ret
         }
-        return ret
-      }
-      msg.signals.forEach((signal, index) => {
-        msg.signals[index] = new Proxy(signal, {
-          set: x
+        msg.signals.forEach((signal, index) => {
+          msg.signals[index] = new Proxy(signal, {
+            set: x
+          })
         })
       })
     })
-  })
 
-  global.vars = {}
+    global.vars = {}
 
-  const devices = data.devices
-  const testers = data.tester
+    const devices = data.devices
+    const testers = data.tester
 
-  const vars: Record<string, VarItem> = cloneDeep(data.vars)
-  const logs = data.logs
+    const vars: Record<string, VarItem> = cloneDeep(data.vars)
+    const logs = data.logs
 
-  for (const log of Object.values(logs)) {
-    if (log.type == 'file' && (log.format == 'asc' || log.format == 'blf')) {
-      if (!path.isAbsolute(log.path)) {
-        log.path = path.join(projectInfo.path, log.path)
-      }
-
-      const id =
-        log.format === 'blf'
-          ? addDeviceTransport(() =>
-              blfTransport(log.path, log.channel, log.method, log.compression)
-            )
-          : addDeviceTransport(() => ascTransport(log.path, log.channel, log.method))
-
-      exTransportList.push(id)
-    }
-  }
-
-  /* --------- */
-  const sysVars = getAllSysVar(devices, testers, data.database.orti)
-
-  for (const v of Object.values(sysVars)) {
-    vars[v.id] = cloneDeep(v)
-  }
-
-  for (const key of Object.keys(vars)) {
-    const v = vars[key]
-
-    if (v.value) {
-      const parentName: string[] = []
-
-      // 递归查找所有父级名称
-      let currentVar = v
-      while (currentVar.parentId) {
-        const parent = vars[currentVar.parentId]
-        if (parent) {
-          parentName.unshift(parent.name) // 将父级名称添加到数组开头
-          currentVar = parent
-        } else {
-          break
+    for (const log of Object.values(logs)) {
+      if (log.type == 'file' && (log.format == 'asc' || log.format == 'blf')) {
+        if (!path.isAbsolute(log.path)) {
+          log.path = path.join(projectInfo.path, log.path)
         }
-      }
 
-      parentName.push(v.name)
-      v.name = parentName.join('.')
+        const logFilePath = resolveLogFilePath(log.path, log.format, {
+          loggerName: log.name,
+          projectName: path.parse(projectInfo.name).name
+        })
+
+        const id =
+          log.format === 'blf'
+            ? addDeviceTransport(() =>
+                blfTransport(logFilePath, log.channel, log.method, log.compression)
+              )
+            : addDeviceTransport(() => ascTransport(logFilePath, log.channel, log.method))
+
+        exTransportList.push(id)
+      }
     }
-    global.vars[key] = v
-  }
-  try {
-    await globalStart(data, projectInfo)
+
+    /* --------- */
+    const sysVars = getAllSysVar(devices, testers, data.database.orti)
+
+    for (const v of Object.values(sysVars)) {
+      vars[v.id] = cloneDeep(v)
+    }
+
+    for (const key of Object.keys(vars)) {
+      const v = vars[key]
+
+      if (v.value) {
+        const parentName: string[] = []
+
+        // 递归查找所有父级名称
+        let currentVar = v
+        while (currentVar.parentId) {
+          const parent = vars[currentVar.parentId]
+          if (parent) {
+            parentName.unshift(parent.name) // 将父级名称添加到数组开头
+            currentVar = parent
+          } else {
+            break
+          }
+        }
+
+        parentName.push(v.name)
+        v.name = parentName.join('.')
+      }
+      global.vars[key] = v
+    }
+    controller.signal.throwIfAborted()
+    await globalStart(data, projectInfo, controller.signal)
   } catch (err: any) {
-    globalStop(true)
+    if (!controller.signal.aborted) {
+      if (!err?.sysLogged) sysLog.error(err?.message || String(err))
+      globalStop(true)
+    }
     throw err
   } finally {
+    if (startController === controller) startController = undefined
     isGlobalStarting = false
   }
 })
@@ -915,6 +968,7 @@ const timerMap = new Map<string, timerType>()
 const someipPeriodMap = new Map<string, { clientKey: string }>()
 
 export function globalStop(emit = false) {
+  startController?.abort(new Error('Measurement start cancelled'))
   trackEvent('app_stop')
   stopPlugins()
   //clear all replay
@@ -952,6 +1006,8 @@ export function globalStop(emit = false) {
     value.close()
   })
   testMap.clear()
+  // Queued with the next start so the port is free before listen.
+  void setProjectSimulateCount(0)
   canBaseMap.forEach((value) => {
     value.close()
     sysLog.info(`stop can device ${value.info.vendor}-${value.info.handle}`)
@@ -1146,56 +1202,12 @@ ipcMain.on('ipc-pwm-set-duty', async (event, ...arg) => {
   }
 })
 
-function getLenByDlc(dlc: number, canFd: boolean) {
-  const map: Record<number, number> = {
-    0: 0,
-    1: 1,
-    2: 2,
-    3: 3,
-    4: 4,
-    5: 5,
-    6: 6,
-    7: 7,
-    8: 8,
-    9: 8,
-    10: 8,
-    11: 8,
-    12: 8,
-    13: 8,
-    14: 8,
-    15: 8
-  }
-  const mapFd: Record<number, number> = {
-    0: 0,
-    1: 1,
-    2: 2,
-    3: 3,
-    4: 4,
-    5: 5,
-    6: 6,
-    7: 7,
-    8: 8,
-    9: 12,
-    10: 16,
-    11: 20,
-    12: 24,
-    13: 32,
-    14: 48,
-    15: 64
-  }
-  if (canFd) {
-    return mapFd[dlc] || 0
-  } else {
-    return map[dlc] || 0
-  }
-}
 ipcMain.on('ipc-send-can', (event, ...arg) => {
   const ia = arg[0] as CanInterAction
 
   const canBase = canBaseMap.get(ia.channel)
   if (canBase) {
     const fd = ia.type.includes('fd')
-    const len = getLenByDlc(ia.dlc, fd)
     if (fd) {
       if (canBase.info.canfd == false) {
         sysLog.error(`can device ${canBase.info.vendor}-${canBase.info.handle} not enable canfd`)
@@ -1217,22 +1229,8 @@ ipcMain.on('ipc-send-can', (event, ...arg) => {
         name: ia.name
       }
     )
-    let b: Buffer = Buffer.alloc(len)
-    let db: CanDB | undefined
-    let message: CanDbMessage | undefined
-    if (ia.database) {
-      db = global.dataSet.database.can[ia.database]
-      if (db) {
-        message = db.messages.find((msg) => msg.id == parseInt(ia.id, 16))
-        if (message) {
-          b = getMessageData(message)
-        }
-      }
-    } else {
-      for (const [index, d] of ia.data.entries()) {
-        b[index] = parseInt(d, 16)
-      }
-    }
+    // Decode the row into DBC signals, then send the encode so the bus matches both editors.
+    const b = linkedPayload(ia)
 
     socket
       .write(b)
@@ -1253,42 +1251,44 @@ ipcMain.on('ipc-send-can', (event, ...arg) => {
 //     return info
 // })
 
-function send(id: string, send: boolean): Buffer | null {
-  const item = timerMap.get(id)
-  if (!item) return null
-  let db: CanDB | undefined
-  let message: CanDbMessage | undefined
-  if (item.ia.database) {
-    db = global.dataSet.database.can[item.ia.database]
-    if (db) {
-      message = db.messages.find((msg) => msg.id == parseInt(item.ia.id, 16))
+function runWithoutPeriodRefresh(fn: () => void) {
+  deferPeriodRefresh++
+  try {
+    fn()
+  } finally {
+    deferPeriodRefresh--
+    if (deferPeriodRefresh === 0) {
+      const ids = [...deferredPeriodIds]
+      deferredPeriodIds.clear()
+      for (const pending of ids) refreshPeriodPayload(pending)
     }
   }
+}
 
-  if (message) {
-    const data = getMessageData(message)
-    if (send) {
-      item.socket.write(data).catch(() => {
-        null
-      })
-    } else {
-      return data
-    }
-  } else {
-    const len = getLenByDlc(item.ia.dlc, item.ia.type.includes('fd'))
-    const b = Buffer.alloc(len)
-    for (const [index, d] of item.ia.data.entries()) {
-      b[index] = parseInt(d, 16)
-    }
-    if (send) {
-      item.socket.write(b).catch(() => {
-        null
-      })
-    } else {
-      return b
-    }
-  }
-  return null
+/** Decode ia.data into DBC signals and return the canonical payload those signals encode. */
+function linkedPayload(ia: CanInterAction): Buffer {
+  const db = ia.database ? global.dataSet.database.can[ia.database] : undefined
+  if (!db) return buildCanInterPayload(ia)
+  let canonical: string[] | undefined
+  runWithoutPeriodRefresh(() => {
+    canonical = linkRawHexToSignals(
+      db,
+      parseInt(ia.id, 16),
+      ia.data,
+      interactionPayloadLength(ia.dlc, ia.type.includes('fd'))
+    )
+  })
+  if (!canonical) return buildCanInterPayload(ia)
+  ia.data = canonical
+  return buildCanInterPayload(ia)
+}
+
+function send(id: string) {
+  const item = timerMap.get(id)
+  if (!item) return
+  item.socket.write(buildCanInterPayload(item.ia)).catch(() => {
+    null
+  })
 }
 ipcMain.on('ipc-update-can-signal', (event, ...arg) => {
   const dbName = arg[0] as string
@@ -1303,21 +1303,62 @@ ipcMain.on('ipc-update-can-signal', (event, ...arg) => {
       const rawsignal = message.signals.find((sig) => sig.name == signalName)
       if (rawsignal) {
         Object.assign(rawsignal, signal)
-        for (const [index, d] of timerMap.entries()) {
-          if (parseInt(d.ia.id, 16) == message.id) {
-            if (d.socket.changePeriodData) {
-              const data = send(index, false)
-              if (data && data.compare(d.data!) != 0) {
-                d.socket.changePeriodData(d.taskId!, data)
-                d.data = data
-              }
-            }
-          }
-        }
+        refreshCanPeriodData(message.id)
       }
     }
   }
 })
+function pushPeriodPayload(item: timerType, data: Buffer) {
+  const changed = !item.data || data.compare(item.data) != 0
+  item.data = data
+  if (changed && item.taskId && item.socket.changePeriodData) {
+    item.socket.changePeriodData(item.taskId, data)
+  }
+}
+
+const deferredPeriodIds = new Set<number>()
+let deferPeriodRefresh = 0
+
+function refreshPeriodPayload(messageId: number) {
+  for (const [, d] of timerMap.entries()) {
+    if (parseInt(d.ia.id, 16) != messageId) continue
+    const db = d.ia.database ? global.dataSet.database.can[d.ia.database] : undefined
+    const message = db?.messages.find((msg) => msg.id == parseInt(d.ia.id, 16))
+    if (!message) continue
+    // Signal edits, raw edits, and setSignal all end as signal values. The row
+    // payload follows that encode so the next interval tick matches the editors.
+    writePeriodRowEncode(d.ia, message)
+    pushPeriodPayload(d, buildCanInterPayload(d.ia))
+  }
+}
+
+export function refreshCanPeriodData(messageId: number) {
+  if (deferPeriodRefresh > 0) {
+    deferredPeriodIds.add(messageId)
+    return
+  }
+  refreshPeriodPayload(messageId)
+}
+
+// Script setSignal does not rely on the measurement-start signal Proxy.
+onCanSignalChanged((messageId) => {
+  refreshCanPeriodData(messageId)
+})
+
+ipcMain.on(
+  'ipc-sync-can-message-signals',
+  (event, dbName: string, id: number, signals: CanSignal[]) => {
+    const db = global.dataSet.database.can[dbName]
+    const message = db?.messages.find((msg) => msg.id === id)
+    if (!message || !Array.isArray(signals)) return
+    runWithoutPeriodRefresh(() => {
+      for (const signal of signals) {
+        const target = message.signals.find((item) => item.name === signal.name)
+        if (target) Object.assign(target, signal)
+      }
+    })
+  }
+)
 
 ipcMain.on('ipc-update-can-period', (event, ...arg) => {
   const id = arg[0] as string
@@ -1326,6 +1367,7 @@ ipcMain.on('ipc-update-can-period', (event, ...arg) => {
   const item = timerMap.get(id)
   if (item) {
     item.ia = ia
+    pushPeriodPayload(item, linkedPayload(item.ia))
   }
 })
 ipcMain.on('ipc-send-can-period', (event, ...arg) => {
@@ -1365,18 +1407,13 @@ ipcMain.on('ipc-send-can-period', (event, ...arg) => {
         timer.socket.stopPeriodSend?.(timer.taskId)
       }
       timer.socket.close()
+      timerMap.delete(id)
     }
     let taskId: string | undefined
     let newTimer: NodeJS.Timeout | undefined
-    let dataSent: Buffer | null = null
+    // Link raw bytes to signals before the first tick so interval and hardware periods match.
+    const dataSent: Buffer | null = linkedPayload(ia)
     if (socket.startPeriodSend) {
-      dataSent = send(id, false)
-      if (dataSent == undefined) {
-        dataSent = Buffer.alloc(getLenByDlc(ia.dlc, fd))
-        for (const [index, d] of ia.data.entries()) {
-          dataSent[index] = parseInt(d, 16)
-        }
-      }
       const initMsg: CanMessage = {
         id: parseInt(ia.id, 16),
         name: ia.name,
@@ -1393,7 +1430,7 @@ ipcMain.on('ipc-send-can-period', (event, ...arg) => {
       taskId = socket.startPeriodSend(initMsg, ia.trigger.period || 10)
     } else {
       newTimer = setInterval(() => {
-        send(id, true)
+        send(id)
       }, ia.trigger.period || 10)
     }
 
@@ -1622,7 +1659,8 @@ type TraceFileFrame = {
   ts: number
   id: number
   dir: string
-  msgType: { idType: string; brs: boolean; canfd: boolean; remote: boolean }
+  msgType: { idType: string; brs: boolean; canfd: boolean; remote: boolean; esi?: boolean }
+  dlc?: number
   data: number[]
   isError?: boolean
 }
@@ -1670,8 +1708,10 @@ ipcMain.handle(
           idType: frame.msgType.idType,
           brs: frame.msgType.brs,
           canfd: frame.msgType.canfd,
-          remote: frame.msgType.remote
+          remote: frame.msgType.remote,
+          esi: frame.msgType.esi
         },
+        dlc: frame.dlc,
         data: Array.from(frame.data),
         isError: frame.isError
       })
@@ -1710,6 +1750,26 @@ ipcMain.handle(
     }
   }
 )
+
+// Export every frame of an opened trace file, keeping its channels and measurement start
+ipcMain.handle('ipc-trace-file-export-asc', async (_event, sessionId: string): Promise<string> => {
+  const session = traceFileSessions.get(sessionId)
+  if (!session) throw new Error('Session not found')
+
+  const start = session.measurementStartTimeMs > 0 ? session.measurementStartTimeMs : Date.now()
+  const lines = [formatAscHeader(new Date(start))]
+  for (const frame of session.frames) {
+    const seconds = frame.ts / 1000_000
+    if (frame.isError) {
+      lines.push(formatCanError(frame.channel, seconds))
+    } else {
+      const msg = { ...frame, data: Buffer.from(frame.data) } as CanMessage
+      lines.push(formatCanMessage(msg, frame.channel, seconds))
+    }
+  }
+  lines.push(ASC_END, '')
+  return lines.join(ASC_EOL)
+})
 
 ipcMain.handle('ipc-trace-file-close', async (_event, sessionId: string) => {
   traceFileSessions.delete(sessionId)
